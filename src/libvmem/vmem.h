@@ -37,6 +37,7 @@
 #include <stddef.h>
 
 #include "pool_hdr.h"
+#include "palloc.h"
 
 #define VMEM_LOG_PREFIX "libvmem"
 #define VMEM_LOG_LEVEL_VAR "VMEM_LOG_LEVEL"
@@ -55,6 +56,8 @@ struct vmem {
 	void *addr;	/* mapped region */
 	size_t size;	/* size of mapped region */
 	int caller_mapped;
+
+	struct palloc_heap heap;
 };
 
 void vmem_init(void);

@@ -44,9 +44,10 @@
 
 #include "libvmem.h"
 
-#include "jemalloc.h"
+#include "palloc.h"
 #include "pmemcommon.h"
 #include "sys_util.h"
+#include "valgrind_internal.h"
 #include "vmem.h"
 
 /*
@@ -54,28 +55,10 @@
  */
 static size_t Header_size;
 
-/*
- * print_jemalloc_messages -- custom print function, for jemalloc
- *
- * Prints traces from jemalloc. All traces from jemalloc
- * are considered as error messages.
- */
-static void
-print_jemalloc_messages(void *ignore, const char *s)
-{
-	ERR("%s", s);
-}
-
-/*
- * print_jemalloc_stats -- print function, for jemalloc statistics
- *
- * Prints statistics from jemalloc. All statistics are printed with level 0.
- */
-static void
-print_jemalloc_stats(void *ignore, const char *s)
-{
-	LOG_NONL(0, "%s", s);
-}
+struct vmem_alloc_header {
+	char padding[40];
+	uint64_t off;
+};
 
 /*
  * vmem_init -- initialization for vmem
@@ -85,6 +68,8 @@ print_jemalloc_stats(void *ignore, const char *s)
 void
 vmem_init(void)
 {
+	COMPILE_ERROR_ON(PALLOC_DATA_OFF != sizeof(struct vmem_alloc_header));
+
 	static bool initialized = false;
 	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -97,12 +82,8 @@ vmem_init(void)
 		common_init(VMEM_LOG_PREFIX, VMEM_LOG_LEVEL_VAR,
 				VMEM_LOG_FILE_VAR, VMEM_MAJOR_VERSION,
 				VMEM_MINOR_VERSION);
-		out_set_vsnprintf_func(je_vmem_navsnprintf);
 		LOG(3, NULL);
 		Header_size = roundup(sizeof(VMEM), Pagesize);
-
-		/* Set up jemalloc messages to a custom print function */
-		je_vmem_malloc_message = print_jemalloc_messages;
 
 		initialized = true;
 	}
@@ -135,6 +116,33 @@ vmem_fini(void)
 	common_fini();
 }
 
+static void
+vmem_persist(void *base, const void *addr, size_t sz)
+{
+}
+
+static void
+vmem_flush(void *base, const void *addr, size_t sz)
+{
+}
+
+static void
+vmem_drain(void *base)
+{
+}
+
+static void *
+vmem_memcpy(void *base, void *dest, const void *src, size_t len)
+{
+	return memcpy(dest, src, len);
+}
+
+static void *
+vmem_memset(void *base, void *dest, int c, size_t len)
+{
+	return memset(dest, c, len);
+}
+
 /*
  * vmem_create -- create a memory pool in a temp file
  */
@@ -165,13 +173,23 @@ vmem_create(const char *dir, size_t size)
 	vmp->size = size;
 	vmp->caller_mapped = 0;
 
-	/* Prepare pool for jemalloc */
-	if (je_vmem_pool_create((void *)((uintptr_t)addr + Header_size),
-			size - Header_size, 1) == NULL) {
-		ERR("pool creation failed");
-		util_unmap(vmp->addr, vmp->size);
-		return NULL;
-	}
+	void *heap_start = (void *)((uintptr_t)addr + Header_size);
+	uint64_t heap_size = size - Header_size;
+	struct pmem_ops p_ops;
+
+	memset(&p_ops, 0, sizeof(p_ops));
+	p_ops.persist = vmem_persist;
+	p_ops.flush = vmem_flush;
+	p_ops.drain = vmem_drain;
+	p_ops.memcpy_persist = vmem_memcpy;
+	p_ops.memset_persist = vmem_memset;
+	p_ops.base = NULL;
+	p_ops.pool_size = 0;
+
+	if (palloc_init(heap_start, heap_size, &p_ops))
+		goto err;
+	if (palloc_boot(&vmp->heap, heap_start, heap_size, heap_start, &p_ops))
+		goto err;
 
 	/*
 	 * If possible, turn off all permissions on the pool header page.
@@ -183,6 +201,9 @@ vmem_create(const char *dir, size_t size)
 
 	LOG(3, "vmp %p", vmp);
 	return vmp;
+err:
+	util_unmap(vmp->addr, vmp->size);
+	return NULL;
 }
 
 /*
@@ -214,12 +235,23 @@ vmem_create_in_region(void *addr, size_t size)
 	vmp->size = size;
 	vmp->caller_mapped = 1;
 
-	/* Prepare pool for jemalloc */
-	if (je_vmem_pool_create((void *)((uintptr_t)addr + Header_size),
-				size - Header_size, 0) == NULL) {
-		ERR("pool creation failed");
+	void *heap_start = (void *)((uintptr_t)addr + Header_size);
+	uint64_t heap_size = size - Header_size;
+	struct pmem_ops p_ops;
+
+	memset(&p_ops, 0, sizeof(p_ops));
+	p_ops.persist = vmem_persist;
+	p_ops.flush = vmem_flush;
+	p_ops.drain = vmem_drain;
+	p_ops.memcpy_persist = vmem_memcpy;
+	p_ops.memset_persist = vmem_memset;
+	p_ops.base = NULL;
+	p_ops.pool_size = 0;
+
+	if (palloc_init(heap_start, heap_size, &p_ops))
 		return NULL;
-	}
+	if (palloc_boot(&vmp->heap, heap_start, heap_size, heap_start, &p_ops))
+		return NULL;
 
 	/*
 	 * If possible, turn off all permissions on the pool header page.
@@ -241,12 +273,7 @@ vmem_delete(VMEM *vmp)
 {
 	LOG(3, "vmp %p", vmp);
 
-	int ret = je_vmem_pool_delete((pool_t *)((uintptr_t)vmp + Header_size));
-	if (ret != 0) {
-		ERR("invalid pool handle: %p", vmp);
-		errno = EINVAL;
-		return;
-	}
+	palloc_heap_cleanup(&vmp->heap);
 
 	util_range_rw(vmp->addr, sizeof(struct pool_hdr));
 
@@ -263,7 +290,12 @@ vmem_check(VMEM *vmp)
 	vmem_init();
 	LOG(3, "vmp %p", vmp);
 
-	return je_vmem_pool_check((pool_t *)((uintptr_t)vmp + Header_size));
+	void *heap_start = (void *)((uintptr_t)vmp->addr + Header_size);
+	uint64_t heap_size = vmp->size - Header_size;
+	if (palloc_heap_check(heap_start, heap_size))
+		return 0;
+
+	return 1;
 }
 
 /*
@@ -273,10 +305,28 @@ void
 vmem_stats_print(VMEM *vmp, const char *opts)
 {
 	LOG(3, "vmp %p opts \"%s\"", vmp, opts ? opts : "");
+}
 
-	je_vmem_pool_malloc_stats_print(
-			(pool_t *)((uintptr_t)vmp + Header_size),
-			print_jemalloc_stats, NULL, opts);
+static int
+constructor_alloc(void *ctx, void *ptr, size_t usable_size, void *arg)
+{
+	LOG(3, NULL);
+
+	ASSERTne(ptr, NULL);
+
+	struct vmem_alloc_header *hdr = (void *)((char *)ptr - PALLOC_DATA_OFF);
+
+	/* temporarily add the OOB header */
+	VALGRIND_ADD_TO_TX(hdr, PALLOC_DATA_OFF);
+
+	hdr->off = 0;
+
+	VALGRIND_REMOVE_FROM_TX(hdr, PALLOC_DATA_OFF);
+
+	/* do not report changes to the new object */
+	VALGRIND_ADD_TO_TX(ptr, usable_size);
+
+	return 0;
 }
 
 /*
@@ -287,8 +337,17 @@ vmem_malloc(VMEM *vmp, size_t size)
 {
 	LOG(3, "vmp %p size %zu", vmp, size);
 
-	return je_vmem_pool_malloc(
-			(pool_t *)((uintptr_t)vmp + Header_size), size);
+	uint64_t off;
+	struct operation_context ctx;
+	operation_init(&ctx, NULL, NULL, NULL);
+	ctx.p_ops = &vmp->heap.p_ops;
+
+	int ret = palloc_operation(&vmp->heap, 0, &off, size + PALLOC_DATA_OFF,
+			constructor_alloc, NULL, &ctx);
+	if (ret)
+		return NULL;
+
+	return (char *)vmp->heap.base + off;
 }
 
 /*
@@ -298,8 +357,18 @@ void
 vmem_free(VMEM *vmp, void *ptr)
 {
 	LOG(3, "vmp %p ptr %p", vmp, ptr);
+	if (ptr == NULL)
+		return;
+	uint64_t hdr_off = *((uint64_t *)ptr - 1);
+	ptr = (char *)ptr - hdr_off;
 
-	je_vmem_pool_free((pool_t *)((uintptr_t)vmp + Header_size), ptr);
+	uint64_t off = (uintptr_t)ptr - (uintptr_t)vmp->heap.base;
+	struct operation_context ctx;
+	operation_init(&ctx, NULL, NULL, NULL);
+	ctx.p_ops = &vmp->heap.p_ops;
+
+	int ret = palloc_operation(&vmp->heap, off, &off, 0, NULL, NULL, &ctx);
+	ASSERTeq(ret, 0);
 }
 
 /*
@@ -310,8 +379,10 @@ vmem_calloc(VMEM *vmp, size_t nmemb, size_t size)
 {
 	LOG(3, "vmp %p nmemb %zu size %zu", vmp, nmemb, size);
 
-	return je_vmem_pool_calloc((pool_t *)((uintptr_t)vmp + Header_size),
-			nmemb, size);
+	void *mem = vmem_malloc(vmp, nmemb * size);
+	memset(mem, 0, nmemb * size);
+
+	return mem;
 }
 
 /*
@@ -321,9 +392,23 @@ void *
 vmem_realloc(VMEM *vmp, void *ptr, size_t size)
 {
 	LOG(3, "vmp %p ptr %p size %zu", vmp, ptr, size);
+	if (ptr == NULL)
+		return vmem_malloc(vmp, size);
 
-	return je_vmem_pool_ralloc((pool_t *)((uintptr_t)vmp + Header_size),
-			ptr, size);
+	uint64_t hdr_off = *((uint64_t *)ptr - 1);
+	ptr = (char *)ptr - hdr_off;
+
+	uint64_t off = (uintptr_t)ptr - (uintptr_t)vmp->heap.base;
+	struct operation_context ctx;
+	operation_init(&ctx, NULL, NULL, NULL);
+	ctx.p_ops = &vmp->heap.p_ops;
+
+	int ret = palloc_operation(&vmp->heap, off, &off,
+			size + PALLOC_DATA_OFF, constructor_alloc, NULL, &ctx);
+	if (ret)
+		return NULL;
+
+	return (char *)vmp->heap.base + off;
 }
 
 /*
@@ -334,9 +419,25 @@ vmem_aligned_alloc(VMEM *vmp, size_t alignment, size_t size)
 {
 	LOG(3, "vmp %p alignment %zu size %zu", vmp, alignment, size);
 
-	return je_vmem_pool_aligned_alloc(
-			(pool_t *)((uintptr_t)vmp + Header_size),
-			alignment, size);
+	uint64_t off;
+	struct operation_context ctx;
+	operation_init(&ctx, NULL, NULL, NULL);
+	ctx.p_ops = &vmp->heap.p_ops;
+
+	int ret = palloc_operation(&vmp->heap, 0, &off,
+			size + PALLOC_DATA_OFF + alignment - 1,
+			constructor_alloc, NULL, &ctx);
+	if (ret)
+		return NULL;
+	char *mem = (char *)vmp->heap.base + off;
+	uint64_t hdr_off = (((uintptr_t)mem + alignment) & ~(alignment - 1)) -
+			(uintptr_t)mem;
+	if (hdr_off && hdr_off != alignment) {
+		mem += hdr_off;
+		*((uint64_t *)mem - 1) = hdr_off;
+	}
+
+	return mem;
 }
 
 /*
@@ -348,8 +449,7 @@ vmem_strdup(VMEM *vmp, const char *s)
 	LOG(3, "vmp %p s %p", vmp, s);
 
 	size_t size = strlen(s) + 1;
-	void *retaddr = je_vmem_pool_malloc(
-			(pool_t *)((uintptr_t)vmp + Header_size), size);
+	void *retaddr = vmem_malloc(vmp, size);
 	if (retaddr == NULL)
 		return NULL;
 
@@ -363,7 +463,13 @@ size_t
 vmem_malloc_usable_size(VMEM *vmp, void *ptr)
 {
 	LOG(3, "vmp %p ptr %p", vmp, ptr);
+	if (ptr == NULL)
+		return 0;
 
-	return je_vmem_pool_malloc_usable_size(
-			(pool_t *)((uintptr_t)vmp + Header_size), ptr);
+	uint64_t hdr_off = *((uint64_t *)ptr - 1);
+	ptr = (char *)ptr - hdr_off;
+
+	uint64_t off = (uintptr_t)ptr - (uintptr_t)vmp->heap.base;
+
+	return palloc_usable_size(&vmp->heap, off) - PALLOC_DATA_OFF - hdr_off;
 }

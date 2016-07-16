@@ -96,6 +96,7 @@ main(int argc, char *argv[])
 		switch (argv[arg][0]) {
 		case 'h':
 			UT_OUT("Testing vmem_check...");
+			/* XXX palloc_check does not detect unmapped memory */
 			if (!sigsetjmp(Jmp, 1)) {
 				UT_OUT("\tvmem_check returned %i",
 							vmem_check(vmp));

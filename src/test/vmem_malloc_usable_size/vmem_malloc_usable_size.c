@@ -44,9 +44,9 @@ static const struct {
 	size_t size;
 	size_t spacing;
 } Check_sizes[] = {
-		{.size = 10, .spacing = 8},
-		{.size = 100, .spacing = 16},
-		{.size = 200, .spacing = 32},
+		{.size = 10, .spacing = 64 - 10},
+		{.size = 100, .spacing = 128 - 100},
+		{.size = 200, .spacing = 256 - 200},
 		{.size = 500, .spacing = 64},
 		{.size = 1000, .spacing = 128},
 		{.size = 2000, .spacing = 256},

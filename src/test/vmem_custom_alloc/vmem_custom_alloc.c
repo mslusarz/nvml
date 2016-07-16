@@ -44,6 +44,7 @@
 static int custom_allocs;
 static int custom_alloc_calls;
 static int expect_malloc;
+static int after_create;
 
 /*
  * malloc_null -- custom malloc function with error
@@ -55,6 +56,10 @@ static void *
 malloc_null(size_t size)
 {
 	++custom_alloc_calls;
+	if (!after_create) {
+		++custom_allocs;
+		return malloc(size);
+	}
 	return NULL;
 }
 
@@ -123,6 +128,7 @@ static void
 pool_test(const char *dir)
 {
 	VMEM *vmp = NULL;
+	after_create = 0;
 
 	if (dir != NULL) {
 		vmp = vmem_create(dir, VMEM_MIN_POOL);
@@ -140,6 +146,7 @@ pool_test(const char *dir)
 			UT_FATAL("!vmem_create");
 		}
 	}
+	after_create = 1;
 
 	char *test = vmem_malloc(vmp, strlen(TEST_STRING_VALUE) + 1);
 

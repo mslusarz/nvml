@@ -40,19 +40,15 @@ SOURCE = libvmem.c vmem.c\
 	$(COMMON)/mmap.c\
 	$(COMMON)/mmap_linux.c\
 	$(COMMON)/out.c\
-	$(COMMON)/util.c
+	$(COMMON)/util.c\
+	../libpmemobj/bucket.c\
+	../libpmemobj/ctree.c\
+	../libpmemobj/heap.c\
+	../libpmemobj/memblock.c\
+	../libpmemobj/memops.c\
+	../libpmemobj/palloc.c\
+	../libpmemobj/redo.c
 
-default: all
-
-include ../jemalloc/jemalloc.mk
-
-ifeq ($(DEBUG),1)
-JEMALLOC_CONFIG += --enable-debug
-endif
-
-INCS += -I$(JEMALLOC_DIR)/include/jemalloc
-INCS += -I$(JEMALLOC_OBJDIR)/include/jemalloc
-EXTRA_OBJS += $(JEMALLOC_LIB)
-LIBS += -pthread
+INCS += -I../libpmemobj
 
 include ../Makefile.inc

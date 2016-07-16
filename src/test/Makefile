@@ -217,8 +217,10 @@ VMEM_TESTS = \
 	vmem_out_of_memory\
 	vmem_pages_purging\
 	vmem_realloc\
-	vmem_realloc_inplace\
-	vmem_stats\
+# XXX palloc can't reallocate inplace\
+#	vmem_realloc_inplace\
+# XXX palloc does not report any statistics \
+#	vmem_stats\
 	vmem_strdup\
 	vmem_valgrind
 

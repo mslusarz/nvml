@@ -615,9 +615,8 @@ palloc_heap_cleanup(struct palloc_heap *heap)
  * palloc_vg_register_object -- registers object in Valgrind
  */
 void
-palloc_vg_register_object(struct palloc_heap *heap, PMEMoid oid, size_t size)
+palloc_vg_register_object(struct palloc_heap *heap, void *addr, size_t size)
 {
-	void *addr = pmemobj_direct(oid);
 	size_t headers = sizeof(struct allocation_header) + PALLOC_DATA_OFF;
 
 	VALGRIND_DO_MEMPOOL_ALLOC(heap->layout, addr, size);
